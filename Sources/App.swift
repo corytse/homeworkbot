@@ -12,12 +12,14 @@ struct HomeworkHelperApp: App {
         if CommandLine.arguments.contains("--selftest") { AI.selfTest(); exit(0) }
         if let i = CommandLine.arguments.firstIndex(of: "--ask-gemini"), i + 1 < CommandLine.arguments.count {
             // Connection test using the app's own Gemini code and saved settings.
+            // Optional 3rd arg: a JPEG, sent like a scanned homework photo.
             let q = CommandLine.arguments[i + 1], d = UserDefaults.standard
+            let img = CommandLine.arguments.dropFirst(i + 2).first.flatMap { FileManager.default.contents(atPath: $0) }
             let done = DispatchSemaphore(value: 0)
             Task.detached {
                 let start = Date()
                 do {
-                    let r = try await AI.gemini(history: [Turn(role: .kid, text: q)], key: d.string(forKey: "geminiKey") ?? "",
+                    let r = try await AI.gemini(history: [Turn(role: .kid, text: q, image: img)], key: d.string(forKey: "geminiKey") ?? "",
                                                 model: d.string(forKey: "geminiModel") ?? "gemini-3.6-flash")
                     print("OK in \(Int(Date().timeIntervalSince(start)))s:\n\(r)")
                 } catch { print("FAILED: \(error.localizedDescription)") }
@@ -111,10 +113,12 @@ final class Tutor: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
 
     func startCamera() { camera.start(preferredID: defaults.string(forKey: "cameraID") ?? "") }
 
+    static let scanText = "Here is a photo of my homework. Please help me with it."
+
     func capture() {
         guard !paused else { return }
         guard let jpg = camera.snapshotJPEG() else { status = "Camera not ready yet – is the iPhone connected?"; return }
-        send(Turn(role: .kid, text: "Here is a photo of my homework. Please help me with it.", image: jpg))
+        send(Turn(role: .kid, text: Self.scanText, image: jpg))
     }
 
     func newQuestion() {
@@ -154,23 +158,41 @@ final class Tutor: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         let history = turns
         let provider = Provider(rawValue: defaults.string(forKey: "provider") ?? "") ?? .gemini
         Task {
-            var reply: String
-            do {
-                switch provider {
-                case .gemini:
-                    reply = try await AI.gemini(history: history,
-                                                key: defaults.string(forKey: "geminiKey") ?? "",
-                                                model: defaults.string(forKey: "geminiModel") ?? "gemini-3.6-flash")
-                case .claude:
-                    let (r, s) = try await AI.claude(turn: turn, session: claudeSession,
-                                                     path: defaults.string(forKey: "claudePath") ?? "")
-                    reply = r
-                    if gen == generation { claudeSession = s }
+            var turn = turn, history = history, reply = ""
+            for attempt in 0..<2 {
+                do {
+                    switch provider {
+                    case .gemini:
+                        reply = try await AI.gemini(history: history,
+                                                    key: defaults.string(forKey: "geminiKey") ?? "",
+                                                    model: defaults.string(forKey: "geminiModel") ?? "gemini-3.6-flash")
+                    case .claude:
+                        let (r, s) = try await AI.claude(turn: turn, session: claudeSession,
+                                                         path: defaults.string(forKey: "claudePath") ?? "")
+                        reply = r
+                        if gen == generation { claudeSession = s }
+                    }
+                } catch {
+                    reply = "<speak>Oops, I couldn't get an answer. Please ask a grown-up to check.</speak><p><b>Error:</b> \(escape(error.localizedDescription))</p>"
+                    break
                 }
-            } catch {
-                reply = "<speak>Oops, I couldn't get an answer. Please ask a grown-up to check.</speak><p><b>Error:</b> \(escape(error.localizedDescription))</p>"
+                guard gen == generation else { return }
+                // Hoot asked to see her paper: photograph the desk and ask again with the photo (once only).
+                guard attempt == 0, turn.image == nil, reply.contains("<look/>") else { break }
+                // Only auto-photo the desk camera: never send a webcam picture of her face without a key press.
+                if isDeskView, let jpg = camera.snapshotJPEG() {
+                    turn.image = jpg
+                    status = "📸 Looking at your paper…"
+                } else {
+                    turn.text += "\n(The camera can't see my paper right now.)"
+                }
+                guard let i = turns.firstIndex(where: { $0.id == turn.id }) else { return }
+                turns[i] = turn
+                history = Array(turns[...i])
             }
-            guard gen == generation else { return }
+            if reply.contains("<look/>") {   // asked to look twice: don't loop, ask her instead
+                reply = "<speak>I can't quite see it. Can you hold your paper flat under the camera, or read the question to me?</speak><p>📸 Hold your paper flat under the camera, or read the question out loud.</p>"
+            }
             turns.append(Turn(role: .ai, text: reply))
             thinking = false
             if let q = queued {
@@ -360,6 +382,7 @@ struct ContentView: View {
         let s = tutor.status
         let (icon, color, text): (String, Color, String) =
             tutor.paused ? ("moon.zzz.fill", .gray, "Taking a break – press Start when you need me")
+            : tutor.thinking && s.hasPrefix("📸") ? ("camera.fill", Theme.orange, "Let me look at your paper… 📸")
             : tutor.thinking ? ("sparkles", Theme.purple, "Hmm, let me think… (you can keep talking)")
             : s.hasPrefix("Speaking") ? ("speaker.wave.2.fill", Theme.sky, "Talking…")
             : s.hasPrefix("Listening") ? ("mic.fill", Theme.mint, "I'm listening! Ask me anything")
@@ -390,7 +413,8 @@ struct ContentView: View {
             switch t.role {
             case .kid:
                 if let img = t.image {
-                    return kid("📸 Here's my homework!<br><img src=\"data:image/jpeg;base64,\(img.base64EncodedString())\">")
+                    let caption = t.text == Tutor.scanText ? "📸 Here's my homework!" : escape(t.text)   // auto-photo keeps her words
+                    return kid("\(caption)<br><img src=\"data:image/jpeg;base64,\(img.base64EncodedString())\">")
                 }
                 return kid(escape(t.text))
             case .ai:
@@ -426,6 +450,8 @@ struct ContentView: View {
         .ai svg { background: #fff; border-radius: 14px; max-width: 100%; height: auto; display: block; margin: 10px 0; padding: 6px; }
         table { border-collapse: separate; border-spacing: 0; border-radius: 12px; overflow: hidden; border: 2px solid #e6dcff; background: #fff; }
         td, th { padding: 6px 12px; border-bottom: 1px solid #eee6ff; } th { background: #ebe2ff; color: #6d28d9; }
+        blockquote { margin: 10px 0; padding: 8px 14px; background: #fff; border-left: 5px solid #f472b6; border-radius: 10px; font-style: italic; }
+        mark { background: #fff1a8; color: inherit; padding: 0 4px; border-radius: 5px; }
         .note { font-size: 15px; font-style: italic; opacity: .7; }
         .live { font-style: italic; background: #fff !important; border: 2px dashed #f472b6; }
         .msg:has(#live:empty) { display: none; }
