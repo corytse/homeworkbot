@@ -61,7 +61,9 @@ final class Tutor: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @Published var status = "Starting…"
     @Published var thinking = false
     @Published var cameraName = "No camera"
-    @Published var isDeskView = false
+    @Published var isDeskView = false   // camera can see her desk (iPhone Desk View or webcam bird's-eye)
+    @Published var isWarping = false    // MacBook webcam with software bird's-eye view
+    let frames = FrameStore()
     @Published var devices: [AVCaptureDevice] = []
     @Published var paused = false
     @Published var queued: String?   // question asked while thinking, sent after the current answer
@@ -79,19 +81,14 @@ final class Tutor: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         guard !started else { return }
         started = true
         synth.delegate = self
-        camera.onDevice = { [weak self] name, desk in self?.cameraName = name; self?.isDeskView = desk }
-        listener.onPartial = { [weak self] in self?.heard = $0 }
-        listener.onUtterance = { [weak self] text in
-            guard let self else { return }
-            if thinking {
-                // Asked while the AI is still working: hold it and send right after the current answer.
-                queued = [queued, text].compactMap { $0 }.joined(separator: " ")
-                heard = ""
-                listener.start()
-            } else {
-                send(Turn(role: .kid, text: text))
-            }
+        camera.onDevice = { [weak self] name, desk, warp in
+            self?.cameraName = warp ? "MacBook camera – bird's-eye" : name
+            self?.isDeskView = desk
+            self?.isWarping = warp
         }
+        camera.onFrame = { [frames] in frames.image = $0 }
+        listener.onPartial = { [weak self] in self?.heard = $0 }
+        listener.onUtterance = { [weak self] in self?.ask($0) }
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             // Space = scan homework, unless she's typing in a text field (e.g. Settings).
             // 49 = Space, 36 = Return, 76 = keypad Enter
@@ -112,6 +109,20 @@ final class Tutor: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     func startCamera() { camera.start(preferredID: defaults.string(forKey: "cameraID") ?? "") }
+
+    /// A question she spoke or typed.
+    func ask(_ text: String) {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !paused else { return }
+        if thinking {
+            // Asked while the AI is still working: hold it and send right after the current answer.
+            queued = [queued, text].compactMap { $0 }.joined(separator: " ")
+            heard = ""
+            listener.start()
+        } else {
+            send(Turn(role: .kid, text: text))
+        }
+    }
 
     static let scanText = "Here is a photo of my homework. Please help me with it."
 
@@ -276,16 +287,23 @@ struct FunButton: ButtonStyle {
 struct ContentView: View {
     @EnvironmentObject var tutor: Tutor
     @AppStorage("cameraID") private var cameraID = ""
+    @State private var adjusting = false
+    @State private var quad = Quad.load()
+    @State private var typed = ""
+    @FocusState private var typing: Bool
 
     var body: some View {
         VStack(spacing: 16) {
             header
             HStack(alignment: .top, spacing: 20) {
                 cameraColumn.frame(minWidth: 360, maxWidth: 560)
-                Conversation(html: page(tutor.turns, thinking: tutor.thinking, queued: tutor.queued), live: tutor.heard)
-                    .background(.white, in: RoundedRectangle(cornerRadius: 26))
-                    .shadow(color: Theme.purple.opacity(0.15), radius: 14, y: 6)
-                    .frame(minWidth: 440)
+                VStack(spacing: 12) {
+                    Conversation(html: page(tutor.turns, thinking: tutor.thinking, queued: tutor.queued), live: tutor.heard)
+                        .background(.white, in: RoundedRectangle(cornerRadius: 26))
+                        .shadow(color: Theme.purple.opacity(0.15), radius: 14, y: 6)
+                    typingBox
+                }
+                .frame(minWidth: 440)
             }
             controls
         }
@@ -316,7 +334,7 @@ struct ContentView: View {
             Spacer()
             Menu {
                 Picker("Camera", selection: $cameraID) {
-                    Text("Auto – iPhone Desk View").tag("")
+                    Text("Auto – MacBook camera (bird's-eye)").tag("")
                     ForEach(tutor.devices, id: \.uniqueID) { Text($0.localizedName).tag($0.uniqueID) }
                 }
                 .pickerStyle(.inline)
@@ -338,17 +356,70 @@ struct ContentView: View {
         }
     }
 
+    /// Type a question instead of saying it. Return sends; focus then leaves the box so
+    /// Space / Return scan the homework again.
+    private var typingBox: some View {
+        HStack(spacing: 10) {
+            Text("✏️").font(.system(size: 22))
+            TextField("Type your question here, then press Return…", text: $typed)
+                .textFieldStyle(.plain)
+                .font(Theme.rounded(19, .medium))
+                .foregroundStyle(Theme.ink)
+                .focused($typing)
+                .onSubmit(sendTyped)
+            Button(action: sendTyped) {
+                Image(systemName: "paperplane.fill")
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 42, height: 42)
+                    .background(LinearGradient(colors: [Theme.purple, Theme.pink], startPoint: .topLeading, endPoint: .bottomTrailing), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(typed.trimmingCharacters(in: .whitespaces).isEmpty)
+            .opacity(typed.trimmingCharacters(in: .whitespaces).isEmpty ? 0.4 : 1)
+        }
+        .padding(.leading, 16).padding(.trailing, 6).padding(.vertical, 6)
+        .background(.white, in: Capsule())
+        .overlay(Capsule().stroke(typing ? Theme.pink : Theme.purple.opacity(0.2), lineWidth: 2))
+        .shadow(color: Theme.purple.opacity(0.12), radius: 8, y: 3)
+        .disabled(tutor.paused)
+    }
+
+    private func sendTyped() {
+        tutor.ask(typed)
+        typed = ""
+        typing = false
+    }
+
     private var cameraColumn: some View {
         VStack(spacing: 14) {
-            CameraPreview(session: tutor.camera.session)
-                .aspectRatio(4 / 3, contentMode: .fit)
+            LivePreview(store: tutor.frames, editing: adjusting ? $quad : nil)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipShape(RoundedRectangle(cornerRadius: 20))
                 .padding(6)
                 .background(.white, in: RoundedRectangle(cornerRadius: 26))
                 .shadow(color: Theme.purple.opacity(0.15), radius: 14, y: 6)
-            if !tutor.isDeskView {
-                Label("Clip the iPhone on top of the screen to see your desk", systemImage: "iphone.gen3")
+            if adjusting {
+                Text("Drag the 4 pink dots onto the corners of your paper")
+                    .font(Theme.rounded(15, .semibold)).foregroundStyle(Theme.pink)
+            } else if !tutor.isDeskView {
+                Label("This camera can't see your desk – pick MacBook camera in the menu", systemImage: "camera.badge.ellipsis")
                     .font(Theme.rounded(14, .semibold))
                     .foregroundStyle(Theme.orange)
+            }
+            if tutor.isWarping {
+                HStack {
+                    Button(adjusting ? "✅  Done" : "🎯  Adjust view") {
+                        adjusting.toggle()
+                        if !adjusting { quad.save(); tutor.camera.setQuad(quad) }
+                        tutor.camera.setShowRaw(adjusting)
+                    }
+                    .buttonStyle(FunButton(colors: [Theme.pink, Theme.purple], size: 15))
+                    if adjusting {
+                        Button("↺  Reset") { quad = .standard }
+                            .buttonStyle(FunButton(colors: [.gray, .gray.opacity(0.8)], size: 15))
+                    }
+                }
             }
             Button { tutor.capture() } label: {
                 VStack(spacing: 2) {
@@ -359,8 +430,7 @@ struct ContentView: View {
                 .padding(.vertical, 6)
             }
             .buttonStyle(FunButton(colors: [Theme.sunny, Theme.orange]))
-            .disabled(tutor.paused)
-            Spacer(minLength: 0)
+            .disabled(tutor.paused || adjusting)
         }
     }
 
@@ -426,7 +496,7 @@ struct ContentView: View {
         if turns.isEmpty && !thinking {
             body = """
             <div class=hint><div class=owl>🦉</div><h1>Hi there! I'm Hoot!</h1>
-            <p>Put your homework under the iPhone and press <kbd>Space</kbd> or <kbd>Return</kbd> 📸</p>
+            <p>Put your homework on the desk in front of the MacBook and press <kbd>Space</kbd> or <kbd>Return</kbd> 📸</p>
             <p>…or just ask me a question out loud! 🎤</p></div>
             """
         }
@@ -557,7 +627,7 @@ struct SettingsView: View {
             }
             Section("Camera") {
                 Picker("Camera", selection: $cameraID) {
-                    Text("Auto – iPhone Desk View").tag("")
+                    Text("Auto – MacBook camera (bird's-eye)").tag("")
                     ForEach(Camera.devices(), id: \.uniqueID) { Text($0.localizedName).tag($0.uniqueID) }
                 }
             }
