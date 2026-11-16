@@ -73,12 +73,13 @@ final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     func setQuad(_ q: Quad) { lock.lock(); quad = q; lock.unlock() }
     func setShowRaw(_ on: Bool) { lock.lock(); showRaw = on; lock.unlock() }
 
-    /// Picks the saved camera, else the MacBook webcam (bird's-eye), else iPhone Desk View, else anything.
+    /// Picks the saved camera, else iPhone Desk View (sharpest), else the MacBook webcam (bird's-eye), else anything.
+    /// Called again whenever cameras come or go, so it follows the iPhone connecting and dropping out.
     func start(preferredID: String) {
         let all = Self.devices()
         let device = all.first { $0.uniqueID == preferredID }
-            ?? all.first { $0.deviceType == .builtInWideAngleCamera }
             ?? all.first { $0.deviceType == .deskViewCamera }
+            ?? all.first { $0.deviceType == .builtInWideAngleCamera }
             ?? all.first
         let warp = device?.deviceType == .builtInWideAngleCamera
         queue.async { [self] in

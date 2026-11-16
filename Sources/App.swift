@@ -9,7 +9,7 @@ struct HomeworkHelperApp: App {
     @StateObject private var tutor = Tutor()
 
     init() {
-        if CommandLine.arguments.contains("--selftest") { AI.selfTest(); exit(0) }
+        if CommandLine.arguments.contains("--selftest") { AI.selfTest(); Troubleshooter.selfTest(); exit(0) }
         if let i = CommandLine.arguments.firstIndex(of: "--ask-gemini"), i + 1 < CommandLine.arguments.count {
             // Connection test using the app's own Gemini code and saved settings.
             // Optional 3rd arg: a JPEG, sent like a scanned homework photo.
@@ -23,6 +23,15 @@ struct HomeworkHelperApp: App {
                                                 model: d.string(forKey: "geminiModel") ?? "gemini-3.6-flash")
                     print("OK in \(Int(Date().timeIntervalSince(start)))s:\n\(r)")
                 } catch { print("FAILED: \(error.localizedDescription)") }
+                done.signal()
+            }
+            done.wait()
+            exit(0)
+        }
+        if CommandLine.arguments.contains("--camera-check") {   // same report as the 🩺 button, in Terminal
+            let done = DispatchSemaphore(value: 0)
+            Task.detached {
+                for f in await Troubleshooter.run(currentCamera: "") { print("[\(f.level)] \(f.title)\n    \(f.detail)") }
                 done.signal()
             }
             done.wait()
@@ -290,6 +299,7 @@ struct ContentView: View {
     @State private var adjusting = false
     @State private var quad = Quad.load()
     @State private var typed = ""
+    @State private var showHelp = false
     @FocusState private var typing: Bool
 
     var body: some View {
@@ -334,7 +344,7 @@ struct ContentView: View {
             Spacer()
             Menu {
                 Picker("Camera", selection: $cameraID) {
-                    Text("Auto – MacBook camera (bird's-eye)").tag("")
+                    Text("Auto – iPhone Desk View, else MacBook camera").tag("")
                     ForEach(tutor.devices, id: \.uniqueID) { Text($0.localizedName).tag($0.uniqueID) }
                 }
                 .pickerStyle(.inline)
@@ -345,6 +355,12 @@ struct ContentView: View {
             .fixedSize()
             .padding(.horizontal, 14).padding(.vertical, 8)
             .background(.white.opacity(0.8), in: Capsule())
+            Button { showHelp = true } label: {
+                Text("🩺").font(.system(size: 18)).frame(width: 38, height: 38).background(.white.opacity(0.8), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .help("iPhone camera check")
+            .sheet(isPresented: $showHelp) { TroubleshooterView(currentCamera: tutor.cameraName) }
             SettingsLink {
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: 18))
@@ -627,7 +643,7 @@ struct SettingsView: View {
             }
             Section("Camera") {
                 Picker("Camera", selection: $cameraID) {
-                    Text("Auto – MacBook camera (bird's-eye)").tag("")
+                    Text("Auto – iPhone Desk View, else MacBook camera").tag("")
                     ForEach(Camera.devices(), id: \.uniqueID) { Text($0.localizedName).tag($0.uniqueID) }
                 }
             }
