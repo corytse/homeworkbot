@@ -84,38 +84,83 @@ enum AI {
         let body = try JSONSerialization.data(withJSONObject:
             ["system_instruction": ["parts": [["text": systemPrompt]]], "contents": contents] as [String: Any])
 
-        // Popular models are often overloaded (503 / hang). Try the chosen one, then fall back.
-        // ponytail: fixed fallback list (checked Nov 2026); update when Google retires these models.
-        var models = [model]
-        for m in fallbackModels where !models.contains(m) { models.append(m) }
-        var lastError = "no answer"
-        for m in models {
-            var req = URLRequest(url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(m):generateContent")!)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.setValue(key, forHTTPHeaderField: "X-goog-api-key")
-            req.httpBody = body
-            req.timeoutInterval = 35
-            guard let (data, _) = try? await URLSession.shared.data(for: req) else {
-                lastError = "\(m) timed out"
-                continue
+        // Popular models are often overloaded (503) or hang. Start the chosen model; if it hasn't answered
+        // within `hedgeAfter` seconds (or it fails), start the next one alongside and take the first answer.
+        let order = orderedModels(primary: model)
+        return try await withThrowingTaskGroup(of: Attempt.self) { group in
+            var next = 0, running = 0, lastError = "no answer"
+            func launchNext() {
+                guard next < order.count else { return }
+                let m = order[next]; next += 1; running += 1
+                group.addTask { await attempt(m, body: body, key: key) }
+                if next < order.count {
+                    group.addTask { try? await Task.sleep(for: .seconds(hedgeAfter)); return .tick }
+                }
             }
-            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-            if let err = json["error"] as? [String: Any] {
-                lastError = "\(m): \(err["message"] ?? "error")"
-                let code = err["code"] as? Int ?? 0
-                if [429, 500, 503, 404].contains(code) { continue }   // busy / quota / retired → next model
-                break                                                 // e.g. bad key: no point trying others
+            launchNext()
+            for try await r in group {
+                switch r {
+                case .answer(let m, let text):
+                    group.cancelAll()
+                    noteBusy(m, false)
+                    return text
+                case .failed(let m, let why, let tryOthers):
+                    running -= 1
+                    lastError = why
+                    noteBusy(m, true)
+                    guard tryOthers else { group.cancelAll(); throw msg("Gemini: \(why)") }
+                    if running == 0 { launchNext() }
+                case .tick:
+                    if running > 0 { launchNext() }   // still waiting: hedge with the next model
+                }
+                if running == 0 && next >= order.count { break }
             }
-            let parts = ((json["candidates"] as? [[String: Any]])?.first?["content"] as? [String: Any])?["parts"] as? [[String: Any]]
-            let text = parts?.compactMap { $0["text"] as? String }.joined() ?? ""
-            if !text.isEmpty { return text }
-            lastError = "\(m) returned no answer"
+            group.cancelAll()
+            throw msg("Gemini is very busy right now (\(lastError)). Try again in a minute, or switch to Claude in Settings.")
         }
-        throw msg("Gemini: \(lastError)")
     }
 
-    static let fallbackModels = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-flash-lite-latest"]
+    /// Default backups, tried in order after the chosen model. Editable in Settings (comma-separated).
+    // ponytail: list checked Nov 2026; Google retires model names every few months.
+    static let defaultFallbacks = "gemini-3.5-flash, gemini-flash-lite-latest, gemini-3.1-flash-lite, gemini-3.6-flash"
+    static let hedgeAfter = 12.0
+
+    private enum Attempt { case answer(String, String), failed(String, String, Bool), tick }
+
+    private static func attempt(_ m: String, body: Data, key: String) async -> Attempt {
+        var req = URLRequest(url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(m):generateContent")!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(key, forHTTPHeaderField: "X-goog-api-key")
+        req.httpBody = body
+        req.timeoutInterval = 60
+        guard let (data, _) = try? await URLSession.shared.data(for: req) else { return .failed(m, "\(m) timed out", true) }
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        if let err = json["error"] as? [String: Any] {
+            let code = err["code"] as? Int ?? 0
+            // busy / quota / server error / retired model → try others; bad key or bad request → stop
+            return .failed(m, "\(m): \(err["message"] ?? "error")", [429, 500, 503, 504, 404].contains(code))
+        }
+        let parts = ((json["candidates"] as? [[String: Any]])?.first?["content"] as? [String: Any])?["parts"] as? [[String: Any]]
+        let text = parts?.compactMap { $0["text"] as? String }.joined() ?? ""
+        return text.isEmpty ? .failed(m, "\(m) returned no answer", true) : .answer(m, text)
+    }
+
+    // Models that failed recently go to the back of the queue for 10 minutes.
+    private static let busyLock = NSLock()
+    nonisolated(unsafe) private static var busyUntil: [String: Date] = [:]
+    private static func noteBusy(_ m: String, _ busy: Bool) {
+        busyLock.lock(); busyUntil[m] = busy ? Date().addingTimeInterval(600) : nil; busyLock.unlock()
+    }
+
+    static func orderedModels(primary: String) -> [String] {
+        let backups = (UserDefaults.standard.string(forKey: "geminiFallbacks") ?? defaultFallbacks)
+            .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        var all: [String] = []
+        for m in [primary] + backups where !m.isEmpty && !all.contains(m) { all.append(m) }
+        busyLock.lock(); let busy = busyUntil.filter { $0.value > Date() }; busyLock.unlock()
+        return all.filter { busy[$0] == nil } + all.filter { busy[$0] != nil }   // stable: busy ones last
+    }
 
     // MARK: Claude via Claude Code CLI
 

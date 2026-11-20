@@ -604,6 +604,7 @@ struct SettingsView: View {
     @AppStorage("provider") private var provider = Provider.gemini.rawValue
     @AppStorage("geminiKey") private var geminiKey = ""
     @AppStorage("geminiModel") private var geminiModel = "gemini-3.6-flash"
+    @AppStorage("geminiFallbacks") private var geminiFallbacks = AI.defaultFallbacks
     @AppStorage("claudePath") private var claudePath = ""
     @AppStorage("voiceID") private var voiceID = ""
     @AppStorage("rate") private var rate = 0.47
@@ -620,6 +621,9 @@ struct SettingsView: View {
                     // ponytail: key kept in app preferences (user-only readable); move to Keychain if the Mac is shared.
                     SecureField("Gemini API key", text: $geminiKey)
                     TextField("Gemini model", text: $geminiModel)
+                    TextField("Backup models", text: $geminiFallbacks)
+                    Text("If the model is busy or slow (12 s), Hoot also asks the next backup and uses whichever answers first. Busy models are skipped for 10 minutes.")
+                        .font(.caption).foregroundStyle(.secondary)
                 } else {
                     TextField("claude CLI path", text: $claudePath, prompt: Text(AI.findClaude() ?? "/path/to/claude"))
                     Text("Uses your Claude Code login. Leave empty to auto-detect.").font(.caption).foregroundStyle(.secondary)
