@@ -9,7 +9,9 @@ struct HomeworkHelperApp: App {
     @StateObject private var tutor = Tutor()
 
     init() {
-        if CommandLine.arguments.contains("--selftest") { AI.selfTest(); Troubleshooter.selfTest(); exit(0) }
+        if CommandLine.arguments.contains("--selftest") {
+            AI.selfTest(); Troubleshooter.selfTest(); MainActor.assumeIsolated { Tutor.wakeSelfTest() }; print("all selftests ok"); exit(0)
+        }
         if let i = CommandLine.arguments.firstIndex(of: "--ask-gemini"), i + 1 < CommandLine.arguments.count {
             // Connection test using the app's own Gemini code and saved settings.
             // Optional 3rd arg: a JPEG, sent like a scanned homework photo.
@@ -91,18 +93,26 @@ final class Tutor: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         started = true
         synth.delegate = self
         camera.onDevice = { [weak self] name, desk, warp in
-            self?.cameraName = warp ? "MacBook camera – bird's-eye" : name
+            self?.cameraName = warp ? "\(name) – bird's-eye" : name
             self?.isDeskView = desk
             self?.isWarping = warp
         }
         camera.onFrame = { [frames] in frames.image = $0 }
-        listener.onPartial = { [weak self] in self?.heard = $0 }
-        listener.onUtterance = { [weak self] in self?.ask($0) }
+        listener.onPartial = { [weak self] text in
+            guard let self else { return }
+            if !wakeMode || armed { heard = text; armTimer?.invalidate(); return }   // she's talking: keep listening
+            heard = Self.afterWakeWord(text) ?? ""   // wake-word mode: only show speech addressed to Hoot
+        }
+        listener.onUtterance = { [weak self] in self?.heardSentence($0) }
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
-            // Space = scan homework, unless she's typing in a text field (e.g. Settings).
-            // 49 = Space, 36 = Return, 76 = keypad Enter
-            guard [49, 36, 76].contains(e.keyCode), !(NSApp.keyWindow?.firstResponder is NSText) else { return e }
-            self?.capture()
+            // Space = listen to a question, Return / keypad Enter = scan homework.
+            // Ignored while she's typing in a text field (the question box, Settings).
+            guard !(NSApp.keyWindow?.firstResponder is NSText) else { return e }
+            switch e.keyCode {
+            case 49: self?.listenNow()
+            case 36, 76: self?.capture()
+            default: return e
+            }
             return nil
         }
         Task {
@@ -142,6 +152,7 @@ final class Tutor: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
 
     func newQuestion() {
+        disarm()
         generation += 1
         turns = []
         claudeSession = nil
@@ -158,6 +169,7 @@ final class Tutor: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         paused.toggle()
         if paused {
             generation += 1        // drop any answer still on its way
+            disarm()
             thinking = false
             queued = nil
             listener.stop()
@@ -239,14 +251,77 @@ final class Tutor: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private func listen() {
         heard = ""
         guard !paused else { status = "Stopped – press ▶️ Start when you need help"; return }
-        status = "Listening… ask me a question, or press SPACE / RETURN to scan your homework"
+        status = "Listening…"
         listener.start()
+    }
+
+    // MARK: Wake word ("Hey Hoot") / Space to talk
+
+    @Published var armed = false          // wake-word mode: the next sentence goes to Hoot
+    private var armTimer: Timer?
+    var wakeMode: Bool { (defaults.string(forKey: "listenMode") ?? "wake") == "wake" }
+
+    /// A finished sentence from the mic. In wake-word mode only speech after "Hey Hoot"
+    /// (or after Space / right after Hoot speaks) is sent; everything else stays on the Mac.
+    private func heardSentence(_ text: String) {
+        if !wakeMode { return ask(text) }
+        if armed {
+            let q = Self.afterWakeWord(text) ?? text
+            if q.isEmpty { return arm() }   // just "Hey Hoot" again: keep waiting for the question
+            disarm(); return ask(q)
+        }
+        guard let rest = Self.afterWakeWord(text) else { heard = ""; listener.start(); return }   // not for Hoot
+        if rest.split(separator: " ").count >= 2 { ask(rest) } else { arm() }   // "Hey Hoot!" … then the question
+    }
+
+    /// Space: listen for one question now (interrupts Hoot if it's talking).
+    func listenNow() {
+        guard !paused else { return }
+        synth.stopSpeaking(at: .immediate)
+        arm()
+    }
+
+    private func arm(for seconds: Double = 8) {
+        armed = true
+        heard = ""
+        NSSound(named: "Tink")?.play()
+        armTimer?.invalidate()
+        // Gives up if she doesn't start talking in time; any speech cancels this (see onPartial).
+        armTimer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.disarm() }
+        }
+        if !thinking && !synth.isSpeaking { listener.start() }
+    }
+
+    private func disarm() { armed = false; armTimer?.invalidate() }
+
+    /// Text after a "Hey Hoot" at the start, or nil if the sentence isn't addressed to Hoot.
+    /// Allows for how speech recognition tends to hear it ("hey hood", "hi hut", "OK Hoot", …).
+    static func afterWakeWord(_ s: String) -> String? {
+        let re = try! NSRegularExpression(
+            pattern: #"^\W*(?:(?:hey|hi|hay|ok|okay|hello|a)\W+(?:hoot|hoots|hoo|ho|hoe|who|whoo|hut|hutt|hood|hoop|hooch)|hoot|hoots)\b\W*(.*)$"#,
+            options: [.caseInsensitive, .dotMatchesLineSeparators])
+        guard let m = re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)),
+              let r = Range(m.range(at: 1), in: s) else { return nil }
+        return String(s[r]).trimmingCharacters(in: .whitespaces)
+    }
+
+    static func wakeSelfTest() {
+        precondition(afterWakeWord("Hey Hoot what is 7 times 8") == "what is 7 times 8")
+        precondition(afterWakeWord("hey, hood! Can you help me") == "Can you help me")
+        precondition(afterWakeWord("OK Hoot") == "")
+        precondition(afterWakeWord("Hey ho what is 9×9") == "what is 9×9")   // how it's often transcribed
+        precondition(afterWakeWord("Hey who") == "")
+        precondition(afterWakeWord("Who wrote this book") == nil)
+        precondition(afterWakeWord("What is a hoot") == nil)
+        precondition(afterWakeWord("Hootenanny time") == nil)
     }
 
     // Mic stays off while the tutor talks so it doesn't hear itself.
     nonisolated func speechSynthesizer(_ s: AVSpeechSynthesizer, didFinish u: AVSpeechUtterance) {
         // Don't check synth.isSpeaking here: it can still read true inside this callback, which left the mic off.
-        Task { @MainActor in if !self.thinking { self.listen() } }
+        // Wake-word mode: she can answer Hoot's question straight away, without saying "Hey Hoot".
+        Task { @MainActor in if !self.thinking { self.listen(); if self.wakeMode && !self.paused { self.arm() } } }
     }
     nonisolated func speechSynthesizer(_ s: AVSpeechSynthesizer, didCancel u: AVSpeechUtterance) {
         Task { @MainActor in if !self.thinking { self.listen() } }
@@ -297,9 +372,10 @@ struct ContentView: View {
     @EnvironmentObject var tutor: Tutor
     @AppStorage("cameraID") private var cameraID = ""
     @State private var adjusting = false
-    @State private var quad = Quad.load()
+    @State private var quad = Quad.standard
     @State private var typed = ""
     @State private var showHelp = false
+    @AppStorage("listenMode") private var listenMode = "wake"
     @FocusState private var typing: Bool
 
     var body: some View {
@@ -344,7 +420,7 @@ struct ContentView: View {
             Spacer()
             Menu {
                 Picker("Camera", selection: $cameraID) {
-                    Text("Auto – iPhone Desk View, else MacBook camera").tag("")
+                    Text("Auto – iPhone, else USB webcam, else MacBook camera").tag("")
                     ForEach(tutor.devices, id: \.uniqueID) { Text($0.localizedName).tag($0.uniqueID) }
                 }
                 .pickerStyle(.inline)
@@ -426,8 +502,9 @@ struct ContentView: View {
             if tutor.isWarping {
                 HStack {
                     Button(adjusting ? "✅  Done" : "🎯  Adjust view") {
+                        if !adjusting { quad = tutor.camera.currentQuad() }   // this camera's corners
                         adjusting.toggle()
-                        if !adjusting { quad.save(); tutor.camera.setQuad(quad) }
+                        if !adjusting { tutor.camera.setQuad(quad) }
                         tutor.camera.setShowRaw(adjusting)
                     }
                     .buttonStyle(FunButton(colors: [Theme.pink, Theme.purple], size: 15))
@@ -440,7 +517,7 @@ struct ContentView: View {
             Button { tutor.capture() } label: {
                 VStack(spacing: 2) {
                     Text("📸  Scan my homework").font(Theme.rounded(22, .heavy))
-                    Text("or press Space / Return").font(Theme.rounded(13, .semibold)).opacity(0.85)
+                    Text("or press Return ⏎").font(Theme.rounded(13, .semibold)).opacity(0.85)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 6)
@@ -471,6 +548,8 @@ struct ContentView: View {
             : tutor.thinking && s.hasPrefix("📸") ? ("camera.fill", Theme.orange, "Let me look at your paper… 📸")
             : tutor.thinking ? ("sparkles", Theme.purple, "Hmm, let me think… (you can keep talking)")
             : s.hasPrefix("Speaking") ? ("speaker.wave.2.fill", Theme.sky, "Talking…")
+            : tutor.armed ? ("mic.fill", Theme.mint, "I'm listening! Ask away 👂")
+            : s.hasPrefix("Listening") && listenMode == "wake" ? ("ear", Theme.purple, "Say “Hey Hoot!” or press Space to ask")
             : s.hasPrefix("Listening") ? ("mic.fill", Theme.mint, "I'm listening! Ask me anything")
             : s.hasPrefix("Camera") ? ("exclamationmark.triangle.fill", Theme.orange, s)
             : ("hourglass", Theme.purple, "Getting ready…")
@@ -512,8 +591,8 @@ struct ContentView: View {
         if turns.isEmpty && !thinking {
             body = """
             <div class=hint><div class=owl>🦉</div><h1>Hi there! I'm Hoot!</h1>
-            <p>Put your homework on the desk in front of the MacBook and press <kbd>Space</kbd> or <kbd>Return</kbd> 📸</p>
-            <p>…or just ask me a question out loud! 🎤</p></div>
+            <p>Say <b>“Hey Hoot!”</b> or press <kbd>Space</kbd>, then ask your question 🎤</p>
+            <p>To show me your homework, put it in front of the MacBook and press <kbd>Return</kbd> 📸</p></div>
             """
         }
         return """
@@ -605,6 +684,7 @@ struct SettingsView: View {
     @AppStorage("geminiKey") private var geminiKey = ""
     @AppStorage("geminiModel") private var geminiModel = "gemini-3.6-flash"
     @AppStorage("geminiFallbacks") private var geminiFallbacks = AI.defaultFallbacks
+    @AppStorage("listenMode") private var listenMode = "wake"
     @AppStorage("claudePath") private var claudePath = ""
     @AppStorage("voiceID") private var voiceID = ""
     @AppStorage("rate") private var rate = 0.47
@@ -629,6 +709,14 @@ struct SettingsView: View {
                     Text("Uses your Claude Code login. Leave empty to auto-detect.").font(.caption).foregroundStyle(.secondary)
                 }
             }
+            Section("Listening") {
+                Picker("Mic", selection: $listenMode) {
+                    Text("Wake word – say “Hey Hoot” or press Space").tag("wake")
+                    Text("Always listening").tag("always")
+                }
+                Text("Wake word: the mic hears the room on this Mac only, and sends nothing until she says “Hey Hoot” or presses Space. Right after Hoot answers she can reply without the wake word for 8 seconds.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section("Voice") {
                 Picker("Voice", selection: $voiceID) {
                     Text("Default – Serena (Premium)").tag("")
@@ -647,7 +735,7 @@ struct SettingsView: View {
             }
             Section("Camera") {
                 Picker("Camera", selection: $cameraID) {
-                    Text("Auto – iPhone Desk View, else MacBook camera").tag("")
+                    Text("Auto – iPhone, else USB webcam, else MacBook camera").tag("")
                     ForEach(Camera.devices(), id: \.uniqueID) { Text($0.localizedName).tag($0.uniqueID) }
                 }
             }

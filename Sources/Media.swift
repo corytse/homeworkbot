@@ -15,10 +15,13 @@ struct Quad: Codable, Equatable {
     // Rough guess for a screen tilted ~10° forward; fine-tune with "Adjust view".
     static let standard = Quad(tl: .init(x: 0.25, y: 0.50), tr: .init(x: 0.75, y: 0.50),
                                br: .init(x: 0.97, y: 0.98), bl: .init(x: 0.03, y: 0.98))
-    static func load() -> Quad {
-        UserDefaults.standard.data(forKey: "paperQuad").flatMap { try? JSONDecoder().decode(Quad.self, from: $0) } ?? .standard
+    /// Each camera has its own corners (different mount, angle and lens).
+    static func load(for camera: String) -> Quad {
+        let d = UserDefaults.standard
+        let data = d.data(forKey: "paperQuad.\(camera)") ?? d.data(forKey: "paperQuad")   // older single setting
+        return data.flatMap { try? JSONDecoder().decode(Quad.self, from: $0) } ?? .standard
     }
-    func save() { UserDefaults.standard.set(try? JSONEncoder().encode(self), forKey: "paperQuad") }
+    func save(for camera: String) { UserDefaults.standard.set(try? JSONEncoder().encode(self), forKey: "paperQuad.\(camera)") }
 
     /// Perspective-corrects the quad into an upright A4-shaped page, then turns it round 180°
     /// so the writing faces the right way (the camera sees the paper from the far side).
@@ -45,7 +48,8 @@ final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let ctx = CIContext()
     private let lock = NSLock()
     private var latest: CVPixelBuffer?
-    private var quad = Quad.load()
+    private var quad = Quad.standard
+    private var deviceID = ""
     private var warping = false      // true for the MacBook webcam
     private var showRaw = false      // true while she's dragging the corners
     private var lastPreview = 0.0
@@ -70,18 +74,24 @@ final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         }
     }
 
-    func setQuad(_ q: Quad) { lock.lock(); quad = q; lock.unlock() }
+    func currentQuad() -> Quad { lock.lock(); defer { lock.unlock() }; return quad }
+    func setQuad(_ q: Quad) {
+        lock.lock(); quad = q; let id = deviceID; lock.unlock()
+        q.save(for: id)
+    }
     func setShowRaw(_ on: Bool) { lock.lock(); showRaw = on; lock.unlock() }
 
-    /// Picks the saved camera, else iPhone Desk View (sharpest), else the MacBook webcam (bird's-eye), else anything.
+    /// Picks the saved camera, else iPhone Desk View, else a USB webcam, else the MacBook webcam, else anything.
+    /// USB and MacBook webcams get the software bird's-eye view.
     /// Called again whenever cameras come or go, so it follows the iPhone connecting and dropping out.
     func start(preferredID: String) {
         let all = Self.devices()
         let device = all.first { $0.uniqueID == preferredID }
             ?? all.first { $0.deviceType == .deskViewCamera }
+            ?? all.first { $0.deviceType == .external }
             ?? all.first { $0.deviceType == .builtInWideAngleCamera }
             ?? all.first
-        let warp = device?.deviceType == .builtInWideAngleCamera
+        let warp = device?.deviceType == .builtInWideAngleCamera || device?.deviceType == .external
         queue.async { [self] in
             session.beginConfiguration()
             session.inputs.forEach(session.removeInput)
@@ -94,12 +104,13 @@ final class Camera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
                 output.alwaysDiscardsLateVideoFrames = true
                 if session.canAddOutput(output) { session.addOutput(output) }
             }
-            // Full HD for the webcam: the paper is only the bottom part of the picture.
-            let preset: AVCaptureSession.Preset = warp ? .hd1920x1080 : .high
-            if session.canSetSessionPreset(preset) { session.sessionPreset = preset }
+            // Highest resolution the webcam offers: the paper is only part of the picture.
+            let presets: [AVCaptureSession.Preset] = warp ? [.hd4K3840x2160, .hd1920x1080, .high] : [.high]
+            if let p = presets.first(where: session.canSetSessionPreset) { session.sessionPreset = p }
             session.commitConfiguration()
             if !session.isRunning { session.startRunning() }
-            lock.lock(); warping = warp; lock.unlock()
+            let id = device?.uniqueID ?? ""
+            lock.lock(); warping = warp; deviceID = id; quad = Quad.load(for: id); lock.unlock()
             let name = deviceName, desk = device?.deviceType == .deskViewCamera
             DispatchQueue.main.async { self.onDevice(name, desk || warp, warp) }
         }
@@ -196,6 +207,8 @@ final class Listener {
     private var task: SFSpeechRecognitionTask?
     private var silenceTimer: Timer?
     private var text = ""
+    private var committed = ""      // words from earlier segments of the current sentence
+    private let reqLock = NSLock()  // `request` is read on the audio thread
     private var active = false
     private var session = 0
     /// Seconds of silence that end a question. Raise it if she gets cut off mid-sentence.
@@ -213,32 +226,54 @@ final class Listener {
     func start() {
         stop()
         guard let recognizer, recognizer.isAvailable else { return }
-        let req = SFSpeechAudioBufferRecognitionRequest()
-        req.shouldReportPartialResults = true
-        if recognizer.supportsOnDeviceRecognition { req.requiresOnDeviceRecognition = true }
         let input = engine.inputNode
-        input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { buf, _ in req.append(buf) }
+        // The tap feeds whichever recognition request is current (segments swap it, see below).
+        input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { [weak self] buf, _ in
+            guard let self else { return }
+            self.reqLock.lock(); let r = self.request; self.reqLock.unlock()
+            r?.append(buf)
+        }
         engine.prepare()
         do { try engine.start() } catch { input.removeTap(onBus: 0); return }
-        request = req
         text = ""
+        committed = ""
         active = true
+        beginSegment()
+    }
+
+    /// On-device recognition ends a "result" at short pauses ("Hey Hoot, … what is…"). Rather than
+    /// losing the rest, keep the words so far and carry on in a fresh segment; the sentence only ends
+    /// after `silenceSeconds` of quiet.
+    private func beginSegment() {
+        guard let recognizer else { return }
+        let req = SFSpeechAudioBufferRecognitionRequest()
+        req.shouldReportPartialResults = true
+        req.contextualStrings = ["Hey Hoot", "Hoot"]   // helps it hear the wake word
+        if recognizer.supportsOnDeviceRecognition { req.requiresOnDeviceRecognition = true }
+        task?.cancel()
+        reqLock.lock(); request = req; reqLock.unlock()
         session += 1
         let mine = session
         task = recognizer.recognitionTask(with: req) { [weak self] result, error in
             DispatchQueue.main.async {
-                // Late results from an earlier (stopped) session must not leak into this one.
+                // Late results from an earlier segment or stopped session must not leak in.
                 guard let self, self.active, self.session == mine else { return }
                 if let result {
-                    self.text = result.bestTranscription.formattedString
+                    let seg = result.bestTranscription.formattedString
+                    self.text = [self.committed, seg].filter { !$0.isEmpty }.joined(separator: " ")
                     self.onPartial(self.text)
                     self.silenceTimer?.invalidate()
                     self.silenceTimer = Timer.scheduledTimer(withTimeInterval: self.silenceSeconds, repeats: false) { _ in self.finish() }
-                }
-                if error != nil, result == nil {
-                    // Recognizer timed out / hiccupped with nothing heard: just listen again.
-                    self.stop()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.start() }
+                    if result.isFinal { self.committed = self.text; self.beginSegment() }
+                } else if error != nil {
+                    if self.text.isEmpty {
+                        // Timed out / hiccupped with nothing heard: just listen again.
+                        self.stop()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.start() }
+                    } else {
+                        self.committed = self.text
+                        self.beginSegment()
+                    }
                 }
             }
         }
@@ -256,9 +291,8 @@ final class Listener {
         silenceTimer?.invalidate()
         if engine.isRunning { engine.stop() }
         engine.inputNode.removeTap(onBus: 0)
-        request?.endAudio()
+        reqLock.lock(); request?.endAudio(); request = nil; reqLock.unlock()
         task?.cancel()
-        request = nil
         task = nil
     }
 }
